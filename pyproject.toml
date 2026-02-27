@@ -22,7 +22,7 @@ dependencies = [
 #   uv sync --extra sglang    # for SGLang serving
 [project.optional-dependencies]
 vllm   = ["vllm>=0.9.0"]
-sglang = ["sglang>=0.4.0"]
+sglang = ["sglang[all]>=0.4.0", "mooncake-transfer-engine"]
 
 [project.scripts]
 benchmark = "run_benchmark:cli"

@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# sglang_start.sh — 2P2D disaggregated serving: GLM-4.5-Air-FP8 via SGLang + Mooncake
-# All Python calls go through `uv run --extra sglang` so deps are resolved automatically.
-#
-# Usage:
-#   bash server/sglang_start.sh          # launch full 2P2D stack
-#   bash server/sglang_start.sh install   # only sync deps
+# sglang-MTP.sh — 2P2D disaggregated serving with MTP speculative decoding
+# Same as sglang_start.sh but enables the built-in MTP head on GLM-4.5-Air-FP8
+# for speculative token generation (EAGLE algorithm, no separate draft model).
 
 set -euo pipefail
 
@@ -21,6 +18,12 @@ D2_PORT="${DECODE_PORT_2:-30003}"
 R_PORT="${ROUTER_PORT:-8000}"
 MC_PORT="${MOONCAKE_MASTER_PORT:-50051}"
 
+# MTP / speculative decoding settings
+SPEC_ALGO="${SPEC_ALGO:-EAGLE}"
+SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-5}"
+SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-4}"
+SPEC_NUM_DRAFT="${SPEC_NUM_DRAFT:-8}"
+
 export MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-tcp}"
 export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-}"
 export MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEG:-4gb}"
@@ -28,19 +31,20 @@ export MOONCAKE_MASTER="127.0.0.1:${MC_PORT}"
 
 UV="uv run --extra sglang"
 
+# ── MTP flags (appended to every worker) ────────────────────────────
+MTP_FLAGS="--speculative-algorithm ${SPEC_ALGO} \
+--speculative-num-steps ${SPEC_NUM_STEPS} \
+--speculative-eagle-topk ${SPEC_EAGLE_TOPK} \
+--speculative-num-draft-tokens ${SPEC_NUM_DRAFT}"
+
 # ── Helpers ─────────────────────────────────────────────────────────
 cleanup() { kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
-install() {
-    echo "▸ Syncing uv deps (sglang + mooncake)…"
-    uv sync --extra sglang
-    echo "✅ Done."
-}
-
 serve() {
     echo "════════════════════════════════════════════════════════════"
-    echo " 2P2D · ${MODEL} · TP=${TP} · ${MOONCAKE_PROTOCOL}"
+    echo " 2P2D + MTP · ${MODEL} · TP=${TP} · ${MOONCAKE_PROTOCOL}"
+    echo " Spec: algo=${SPEC_ALGO}  steps=${SPEC_NUM_STEPS}  topk=${SPEC_EAGLE_TOPK}  draft=${SPEC_NUM_DRAFT}"
     echo "════════════════════════════════════════════════════════════"
 
     # 1) Mooncake master
@@ -53,26 +57,26 @@ serve() {
     $UV -m sglang.launch_server --model-path "$MODEL" --tp-size "$TP" \
         --disaggregation-mode prefill --base-gpu-id 0 \
         --host "$HOST" --port "$P1_PORT" --max-total-tokens "$MAX_LEN" \
-        --trust-remote-code &
+        --trust-remote-code $MTP_FLAGS &
     sleep 2
 
     $UV -m sglang.launch_server --model-path "$MODEL" --tp-size "$TP" \
         --disaggregation-mode prefill --base-gpu-id 1 \
         --host "$HOST" --port "$P2_PORT" --max-total-tokens "$MAX_LEN" \
-        --trust-remote-code &
+        --trust-remote-code $MTP_FLAGS &
     sleep 2
 
     # 3) Decode workers
     $UV -m sglang.launch_server --model-path "$MODEL" --tp-size "$TP" \
         --disaggregation-mode decode --base-gpu-id 2 \
         --host "$HOST" --port "$D1_PORT" --max-total-tokens "$MAX_LEN" \
-        --trust-remote-code &
+        --trust-remote-code $MTP_FLAGS &
     sleep 2
 
     $UV -m sglang.launch_server --model-path "$MODEL" --tp-size "$TP" \
         --disaggregation-mode decode --base-gpu-id 3 \
         --host "$HOST" --port "$D2_PORT" --max-total-tokens "$MAX_LEN" \
-        --trust-remote-code &
+        --trust-remote-code $MTP_FLAGS &
     sleep 2
 
     # 4) Router
@@ -82,13 +86,11 @@ serve() {
         --host "$HOST" --port "$R_PORT" &
 
     echo ""
-    echo "✅ Router ready → http://${HOST}:${R_PORT}"
+    echo "✅ Router ready → http://${HOST}:${R_PORT}  (MTP speculative decoding ON)"
     wait
 }
 
-# ── Entrypoint ──────────────────────────────────────────────────────
 case "${1:-serve}" in
-    install) install ;;
-    serve)   serve ;;
-    *)       echo "Usage: $0 {install|serve}"; exit 1 ;;
+    serve) serve ;;
+    *)     echo "Usage: $0 {serve}  (run 'bash server/sglang_start.sh install' first)"; exit 1 ;;
 esac

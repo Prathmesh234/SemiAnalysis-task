@@ -1,4 +1,4 @@
-"""proxy.py — FastAPI reverse proxy on :8001 that forwards to :8000 and logs metrics to JSONL."""
+"""proxy.py — FastAPI reverse proxy on :8001 that forwards to :8000 and logs comprehensive metrics to JSONL."""
 
 import json
 import time
@@ -38,20 +38,64 @@ async def _forward(request: Request) -> Response:
 
 
 def _log_metric(path: str, latency: float, req_body: bytes, resp_body: bytes) -> None:
-    """Append a single JSON line with request metadata and timing."""
-    record = {
+    """Append a single JSON line with comprehensive request metadata and timing."""
+    record: dict = {
         "ts": time.time(),
         "path": path,
         "latency_s": round(latency, 4),
         "req_bytes": len(req_body),
         "resp_bytes": len(resp_body),
     }
-    # Best-effort parse token usage from OpenAI-compatible response
+
+    # Parse token usage from OpenAI-compatible response
     try:
         data = json.loads(resp_body)
+
         if "usage" in data:
-            record["usage"] = data["usage"]
-    except (json.JSONDecodeError, KeyError):
+            usage = data["usage"]
+            record["usage"] = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+
+            # SGLang may include prompt_tokens_details with cached_tokens
+            if isinstance(usage.get("prompt_tokens_details"), dict):
+                record["usage"]["prompt_tokens_details"] = usage["prompt_tokens_details"]
+
+            # SGLang may include completion_tokens_details
+            if isinstance(usage.get("completion_tokens_details"), dict):
+                record["usage"]["completion_tokens_details"] = usage["completion_tokens_details"]
+
+        # Capture model name
+        if "model" in data:
+            record["model"] = data["model"]
+
+        # Capture request ID
+        if "id" in data:
+            record["request_id"] = data["id"]
+
+        # Capture finish reason
+        if "choices" in data and data["choices"]:
+            finish_reason = data["choices"][0].get("finish_reason")
+            if finish_reason:
+                record["finish_reason"] = finish_reason
+
+    except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+        pass
+
+    # Parse request body for input metadata
+    try:
+        req_data = json.loads(req_body)
+        if "messages" in req_data:
+            record["num_messages"] = len(req_data["messages"])
+        if "max_tokens" in req_data:
+            record["requested_max_tokens"] = req_data["max_tokens"]
+        if "temperature" in req_data:
+            record["temperature"] = req_data["temperature"]
+        if "stream" in req_data:
+            record["stream"] = req_data["stream"]
+    except (json.JSONDecodeError, KeyError, TypeError):
         pass
 
     with METRICS_PATH.open("a") as f:
