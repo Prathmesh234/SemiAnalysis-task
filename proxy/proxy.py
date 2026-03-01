@@ -1,6 +1,8 @@
 """proxy.py — Translating reverse proxy: Anthropic Messages API → OpenAI Chat Completions API.
 
-Robust translation with real-time token debug prints.
+Handles both streaming (SSE) and non-streaming translation between the two
+API formats so that the ``claude`` CLI (which speaks Anthropic Messages API)
+can talk to an SGLang backend (which speaks OpenAI Chat Completions API).
 """
 
 import json
@@ -19,6 +21,10 @@ METRICS_PATH = Path("metrics.jsonl")
 # Always use the actual SGLang model name
 SGLANG_MODEL = os.environ.get("MODEL_PATH", "zai-org/GLM-4.5-Air-FP8")
 
+
+# ---------------------------------------------------------------------------
+# Request translation: Anthropic → OpenAI
+# ---------------------------------------------------------------------------
 
 def _anthropic_to_openai(body: dict) -> dict:
     """Translate Anthropic Messages API request → OpenAI Chat Completions request."""
@@ -61,6 +67,11 @@ def _anthropic_to_openai(body: dict) -> dict:
         "stream": body.get("stream", False),
     }
 
+    # When streaming, ask SGLang to include usage info in the final chunk
+    # so we can report real token counts in the Anthropic message_delta event.
+    if openai_req["stream"]:
+        openai_req["stream_options"] = {"include_usage": True}
+
     if "top_p" in body:
         openai_req["top_p"] = body["top_p"]
     if "stop_sequences" in body:
@@ -69,6 +80,10 @@ def _anthropic_to_openai(body: dict) -> dict:
     return openai_req
 
 
+# ---------------------------------------------------------------------------
+# Response translation: OpenAI → Anthropic  (non-streaming)
+# ---------------------------------------------------------------------------
+
 def _openai_to_anthropic(data: dict, model: str = "default") -> dict:
     """Translate OpenAI Chat Completions response → Anthropic Messages API response."""
     content = []
@@ -76,18 +91,19 @@ def _openai_to_anthropic(data: dict, model: str = "default") -> dict:
 
     if "choices" in data and data["choices"]:
         choice = data["choices"][0]
-        msg = choice.get("message", {})
-        text = msg.get("content", "")
+        msg = choice.get("message") or {}
+        # Handle content being None, a string, or missing entirely
+        text = msg.get("content") or ""
         if text:
-            content.append({"type": "text", "text": text})
+            content.append({"type": "text", "text": str(text)})
 
-        fr = choice.get("finish_reason", "")
+        fr = choice.get("finish_reason") or ""
         if fr == "length":
             stop_reason = "max_tokens"
         elif fr == "stop":
             stop_reason = "end_turn"
 
-    usage = data.get("usage", {})
+    usage = data.get("usage") or {}
     return {
         "id": data.get("id", f"msg_{int(time.time())}"),
         "type": "message",
@@ -103,61 +119,18 @@ def _openai_to_anthropic(data: dict, model: str = "default") -> dict:
     }
 
 
-def _openai_sse_to_anthropic_sse(openai_data: dict, index: int) -> list[str]:
-    """Convert a single OpenAI SSE chunk to Anthropic SSE event(s)."""
-    events = []
-
-    if index == 0:
-        events.append(_sse_event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": openai_data.get("id", f"msg_{int(time.time())}"),
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": SGLANG_MODEL,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-            }
-        }))
-        events.append(_sse_event("content_block_start", {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        }))
-
-    if "choices" in openai_data and openai_data["choices"]:
-        choice = openai_data["choices"][0]
-        delta = choice.get("delta", {})
-        text = delta.get("content", "")
-
-        if text:
-            events.append(_sse_event("content_block_delta", {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text},
-            }))
-
-        if choice.get("finish_reason"):
-            events.append(_sse_event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": 0,
-            }))
-            stop_reason = "max_tokens" if choice["finish_reason"] == "length" else "end_turn"
-            events.append(_sse_event("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": 0},
-            }))
-            events.append(_sse_event("message_stop", {"type": "message_stop"}))
-
-    return events
-
+# ---------------------------------------------------------------------------
+# SSE helpers
+# ---------------------------------------------------------------------------
 
 def _sse_event(event_type: str, data: dict) -> str:
+    """Format a single Anthropic-style SSE event."""
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
+
+# ---------------------------------------------------------------------------
+# Endpoint handler — dispatcher
+# ---------------------------------------------------------------------------
 
 async def _handle_messages(request: Request) -> Response:
     body_bytes = await request.body()
@@ -179,6 +152,10 @@ async def _handle_messages(request: Request) -> Response:
     else:
         return await _handle_non_stream(openai_req, model, t0, body_bytes, body)
 
+
+# ---------------------------------------------------------------------------
+# Non-streaming path
+# ---------------------------------------------------------------------------
 
 async def _handle_non_stream(
     openai_req: dict, model: str, t0: float, req_body: bytes, orig_body: dict
@@ -213,12 +190,21 @@ async def _handle_non_stream(
     )
 
 
+# ---------------------------------------------------------------------------
+# Streaming path  (OpenAI SSE → Anthropic SSE)
+# ---------------------------------------------------------------------------
+
 async def _handle_stream(
     openai_req: dict, model: str, t0: float, req_body: bytes, orig_body: dict
 ) -> StreamingResponse:
     async def generate():
         full_text = ""
-        chunk_index = 0
+        sent_header = False       # True once message_start has been emitted
+        stream_finished = False   # True once finish_reason received
+        msg_id = f"msg_{int(time.time())}"
+        input_tokens = 0
+        output_tokens = 0
+
         async with httpx.AsyncClient(timeout=300) as client:
             async with client.stream(
                 "POST",
@@ -227,38 +213,114 @@ async def _handle_stream(
             ) as resp:
                 if resp.status_code != 200:
                     print(f"  [Proxy] SGLang Error: {resp.status_code}")
-                    yield _sse_event("error", {"message": f"SGLang error {resp.status_code}"})
+                    yield _sse_event("error", {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": f"Backend error {resp.status_code}"},
+                    })
                     return
 
                 async for line in resp.aiter_lines():
-                    # Handle data: or data: (one or more spaces)
                     if not line.startswith("data:"):
                         continue
-                    
+
                     data_str = line.split("data:", 1)[1].strip()
                     if not data_str or data_str == "[DONE]":
                         continue
-                    
+
                     try:
                         chunk = json.loads(data_str)
-                        if "choices" in chunk and chunk["choices"]:
-                            text = chunk["choices"][0].get("delta", {}).get("content", "")
-                            if text:
-                                print(text, end="", flush=True)
-                                full_text += text
-                        
-                        events = _openai_sse_to_anthropic_sse(chunk, chunk_index)
-                        for event in events:
-                            yield event
-                        chunk_index += 1
                     except json.JSONDecodeError:
                         continue
 
-        print("\n  [Proxy] Stream complete.")
+                    # Grab the message id from the first chunk
+                    if "id" in chunk:
+                        msg_id = chunk["id"]
+
+                    # Capture usage from the final usage-only chunk
+                    # (sent when stream_options.include_usage is true)
+                    if "usage" in chunk and chunk["usage"]:
+                        input_tokens = chunk["usage"].get("prompt_tokens", input_tokens)
+                        output_tokens = chunk["usage"].get("completion_tokens", output_tokens)
+
+                    # Skip chunks without choices (e.g. the usage-only tail chunk)
+                    if not chunk.get("choices"):
+                        continue
+
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta") or {}
+                    text = delta.get("content") or ""
+                    finish = choice.get("finish_reason")
+
+                    # --- Emit Anthropic preamble on first real chunk ----------
+                    if not sent_header:
+                        yield _sse_event("message_start", {
+                            "type": "message_start",
+                            "message": {
+                                "id": msg_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "model": SGLANG_MODEL,
+                                "stop_reason": None,
+                                "stop_sequence": None,
+                                "usage": {
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": 0,
+                                },
+                            },
+                        })
+                        yield _sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        yield _sse_event("ping", {"type": "ping"})
+                        sent_header = True
+
+                    # --- Content delta ----------------------------------------
+                    if text:
+                        print(text, end="", flush=True)
+                        full_text += text
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": text},
+                        })
+
+                    # --- Finish -----------------------------------------------
+                    if finish:
+                        stream_finished = True
+                        stop = "max_tokens" if finish == "length" else "end_turn"
+                        yield _sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": 0,
+                        })
+                        yield _sse_event("message_delta", {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": stop, "stop_sequence": None},
+                            "usage": {"output_tokens": output_tokens},
+                        })
+                        yield _sse_event("message_stop", {"type": "message_stop"})
+
+        # If we opened the stream but never got a finish_reason, close cleanly
+        # so the Claude CLI doesn't hang waiting for message_stop.
+        if sent_header and not stream_finished:
+            yield _sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": 0,
+            })
+            yield _sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            })
+            yield _sse_event("message_stop", {"type": "message_stop"})
+
+        print(f"\n  [Proxy] Stream complete. {len(full_text)} chars, {output_tokens} output tokens")
         latency = time.perf_counter() - t0
         _log_metric(
             "/v1/messages", latency, req_body,
-            json.dumps({"full_text_length": len(full_text)}).encode(),
+            json.dumps({"full_text_length": len(full_text), "output_tokens": output_tokens}).encode(),
             stream=True, full_text=full_text,
         )
 
