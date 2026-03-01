@@ -14,7 +14,7 @@ from pathlib import Path
 
 from client.task_queue import TaskItem, run_queue
 from client.turn_manager import run_multi_turn
-from datasets.load_swebench import load_swebench_tasks
+from task_loaders.load_swebench import load_swebench_tasks
 from metrics.collector import collect, collect_continuous
 from metrics.report import (
     gpu_timeline_plot,

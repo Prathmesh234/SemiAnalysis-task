@@ -1,30 +1,281 @@
-"""proxy.py — FastAPI reverse proxy on :8001 that forwards to :8000 and logs comprehensive metrics to JSONL."""
+"""proxy.py — Translating reverse proxy: Anthropic Messages API → OpenAI Chat Completions API.
+
+Robust translation with real-time token debug prints.
+"""
 
 import json
+import os
 import time
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="LLM Metrics Proxy")
 
 BACKEND_URL = "http://localhost:8000"
 METRICS_PATH = Path("metrics.jsonl")
+# Always use the actual SGLang model name
+SGLANG_MODEL = os.environ.get("MODEL_PATH", "zai-org/GLM-4.5-Air-FP8")
 
 
-async def _forward(request: Request) -> Response:
-    """Forward an incoming request to the backend and log latency + token counts."""
+def _anthropic_to_openai(body: dict) -> dict:
+    """Translate Anthropic Messages API request → OpenAI Chat Completions request."""
+    messages = []
+
+    if "system" in body:
+        system_text = body["system"]
+        if isinstance(system_text, list):
+            system_text = "\n".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in system_text
+            )
+        messages.append({"role": "system", "content": system_text})
+
+    for msg in body.get("messages", []):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_result":
+                        text_parts.append(str(block.get("content", "")))
+                    else:
+                        text_parts.append(json.dumps(block))
+                else:
+                    text_parts.append(str(block))
+            content = "\n".join(text_parts)
+
+        messages.append({"role": role, "content": content})
+
+    openai_req = {
+        "model": SGLANG_MODEL,
+        "messages": messages,
+        "max_tokens": body.get("max_tokens", 4096),
+        "temperature": body.get("temperature", 0.7),
+        "stream": body.get("stream", False),
+    }
+
+    if "top_p" in body:
+        openai_req["top_p"] = body["top_p"]
+    if "stop_sequences" in body:
+        openai_req["stop"] = body["stop_sequences"]
+
+    return openai_req
+
+
+def _openai_to_anthropic(data: dict, model: str = "default") -> dict:
+    """Translate OpenAI Chat Completions response → Anthropic Messages API response."""
+    content = []
+    stop_reason = "end_turn"
+
+    if "choices" in data and data["choices"]:
+        choice = data["choices"][0]
+        msg = choice.get("message", {})
+        text = msg.get("content", "")
+        if text:
+            content.append({"type": "text", "text": text})
+
+        fr = choice.get("finish_reason", "")
+        if fr == "length":
+            stop_reason = "max_tokens"
+        elif fr == "stop":
+            stop_reason = "end_turn"
+
+    usage = data.get("usage", {})
+    return {
+        "id": data.get("id", f"msg_{int(time.time())}"),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+def _openai_sse_to_anthropic_sse(openai_data: dict, index: int) -> list[str]:
+    """Convert a single OpenAI SSE chunk to Anthropic SSE event(s)."""
+    events = []
+
+    if index == 0:
+        events.append(_sse_event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": openai_data.get("id", f"msg_{int(time.time())}"),
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": SGLANG_MODEL,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        }))
+        events.append(_sse_event("content_block_start", {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }))
+
+    if "choices" in openai_data and openai_data["choices"]:
+        choice = openai_data["choices"][0]
+        delta = choice.get("delta", {})
+        text = delta.get("content", "")
+
+        if text:
+            events.append(_sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }))
+
+        if choice.get("finish_reason"):
+            events.append(_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": 0,
+            }))
+            stop_reason = "max_tokens" if choice["finish_reason"] == "length" else "end_turn"
+            events.append(_sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            }))
+            events.append(_sse_event("message_stop", {"type": "message_stop"}))
+
+    return events
+
+
+def _sse_event(event_type: str, data: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _handle_messages(request: Request) -> Response:
+    body_bytes = await request.body()
+    t0 = time.perf_counter()
+
+    try:
+        body = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        return Response(content=b'{"error": "invalid JSON"}', status_code=400)
+
+    model = body.get("model", "default")
+    is_stream = body.get("stream", False)
+    openai_req = _anthropic_to_openai(body)
+
+    print(f"  [Proxy] Inbound {'Stream' if is_stream else 'Static'} request to {model}")
+
+    if is_stream:
+        return await _handle_stream(openai_req, model, t0, body_bytes, body)
+    else:
+        return await _handle_non_stream(openai_req, model, t0, body_bytes, body)
+
+
+async def _handle_non_stream(
+    openai_req: dict, model: str, t0: float, req_body: bytes, orig_body: dict
+) -> Response:
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(
+            f"{BACKEND_URL}/v1/chat/completions",
+            json=openai_req,
+        )
+
+    latency = time.perf_counter() - t0
+
+    try:
+        openai_data = resp.json()
+        print(f"  [Proxy] Raw SGLang Response: {resp.content.decode()[:500]}...")
+        anthropic_resp = _openai_to_anthropic(openai_data, model)
+        text = ""
+        if anthropic_resp.get("content"):
+            text = anthropic_resp["content"][0].get("text", "")
+        print(f"  [Proxy] Response: {text[:60]}... ({latency:.2f}s)")
+        resp_bytes = json.dumps(anthropic_resp).encode()
+    except Exception as e:
+        print(f"  [Proxy] Translation Error: {e}")
+        resp_bytes = resp.content
+
+    _log_metric("/v1/messages", latency, req_body, resp_bytes, openai_resp=resp.content)
+
+    return Response(
+        content=resp_bytes,
+        status_code=resp.status_code,
+        media_type="application/json",
+    )
+
+
+async def _handle_stream(
+    openai_req: dict, model: str, t0: float, req_body: bytes, orig_body: dict
+) -> StreamingResponse:
+    async def generate():
+        full_text = ""
+        chunk_index = 0
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream(
+                "POST",
+                f"{BACKEND_URL}/v1/chat/completions",
+                json=openai_req,
+            ) as resp:
+                if resp.status_code != 200:
+                    print(f"  [Proxy] SGLang Error: {resp.status_code}")
+                    yield _sse_event("error", {"message": f"SGLang error {resp.status_code}"})
+                    return
+
+                async for line in resp.aiter_lines():
+                    # Handle data: or data: (one or more spaces)
+                    if not line.startswith("data:"):
+                        continue
+                    
+                    data_str = line.split("data:", 1)[1].strip()
+                    if not data_str or data_str == "[DONE]":
+                        continue
+                    
+                    try:
+                        chunk = json.loads(data_str)
+                        if "choices" in chunk and chunk["choices"]:
+                            text = chunk["choices"][0].get("delta", {}).get("content", "")
+                            if text:
+                                print(text, end="", flush=True)
+                                full_text += text
+                        
+                        events = _openai_sse_to_anthropic_sse(chunk, chunk_index)
+                        for event in events:
+                            yield event
+                        chunk_index += 1
+                    except json.JSONDecodeError:
+                        continue
+
+        print("\n  [Proxy] Stream complete.")
+        latency = time.perf_counter() - t0
+        _log_metric(
+            "/v1/messages", latency, req_body,
+            json.dumps({"full_text_length": len(full_text)}).encode(),
+            stream=True, full_text=full_text,
+        )
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+async def _forward_generic(request: Request) -> Response:
     body = await request.body()
     t0 = time.perf_counter()
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         backend_resp = await client.request(
             method=request.method,
             url=f"{BACKEND_URL}{request.url.path}",
             headers=dict(request.headers),
             content=body,
-            timeout=300,
+            timeout=60,
         )
 
     latency = time.perf_counter() - t0
@@ -37,20 +288,22 @@ async def _forward(request: Request) -> Response:
     )
 
 
-def _log_metric(path: str, latency: float, req_body: bytes, resp_body: bytes) -> None:
-    """Append a single JSON line with comprehensive request metadata and timing."""
+def _log_metric(
+    path: str, latency: float, req_body: bytes, resp_body: bytes,
+    openai_resp: bytes = b"", stream: bool = False, full_text: str = "",
+) -> None:
     record: dict = {
         "ts": time.time(),
         "path": path,
         "latency_s": round(latency, 4),
         "req_bytes": len(req_body),
         "resp_bytes": len(resp_body),
+        "stream": stream,
     }
 
-    # Parse token usage from OpenAI-compatible response
+    raw = openai_resp or resp_body
     try:
-        data = json.loads(resp_body)
-
+        data = json.loads(raw)
         if "usage" in data:
             usage = data["usage"]
             record["usage"] = {
@@ -58,51 +311,22 @@ def _log_metric(path: str, latency: float, req_body: bytes, resp_body: bytes) ->
                 "completion_tokens": usage.get("completion_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             }
+        if "model" in data: record["model"] = data["model"]
+        if "id" in data: record["request_id"] = data["id"]
+    except: pass
 
-            # SGLang may include prompt_tokens_details with cached_tokens
-            if isinstance(usage.get("prompt_tokens_details"), dict):
-                record["usage"]["prompt_tokens_details"] = usage["prompt_tokens_details"]
-
-            # SGLang may include completion_tokens_details
-            if isinstance(usage.get("completion_tokens_details"), dict):
-                record["usage"]["completion_tokens_details"] = usage["completion_tokens_details"]
-
-        # Capture model name
-        if "model" in data:
-            record["model"] = data["model"]
-
-        # Capture request ID
-        if "id" in data:
-            record["request_id"] = data["id"]
-
-        # Capture finish reason
-        if "choices" in data and data["choices"]:
-            finish_reason = data["choices"][0].get("finish_reason")
-            if finish_reason:
-                record["finish_reason"] = finish_reason
-
-    except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-        pass
-
-    # Parse request body for input metadata
-    try:
-        req_data = json.loads(req_body)
-        if "messages" in req_data:
-            record["num_messages"] = len(req_data["messages"])
-        if "max_tokens" in req_data:
-            record["requested_max_tokens"] = req_data["max_tokens"]
-        if "temperature" in req_data:
-            record["temperature"] = req_data["temperature"]
-        if "stream" in req_data:
-            record["stream"] = req_data["stream"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
+    if stream and full_text: record["completion_text_length"] = len(full_text)
 
     with METRICS_PATH.open("a") as f:
         f.write(json.dumps(record) + "\n")
 
 
+@app.post("/v1/messages")
+@app.post("/v1/v1/messages")
+async def messages_endpoint(request: Request) -> Response:
+    return await _handle_messages(request)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(request: Request) -> Response:
-    """Catch-all route that proxies every request to the backend."""
-    return await _forward(request)
+    return await _forward_generic(request)
