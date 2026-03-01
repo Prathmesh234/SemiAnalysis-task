@@ -34,33 +34,14 @@ This document tracks all the roadblocks and corresponding fixes encountered whil
 
 ---
 
-## Current Issue: Format Translation / SSE Mismatch
+## Resolved: Format Translation / SSE Mismatch
 
-**State:**
-The server stack is fully up, the proxy processes the requests and returns a `200 OK`. However, the Claude CLI receives an empty response and `0` tokens. 
-
-**Symptoms:**
-When hitting the Anthropic mock endpoint directly via `curl` with `stream: false`, the proxy spits back:
-```json
-{
-    "id": "msg_1772397840",
-    "type": "message",
-    "role": "assistant",
-    "content": [],
-    "model": "zai-org/GLM-4.5-Air-FP8",
-    "stop_reason": "end_turn",
-    "stop_sequence": null,
-    "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0
-    }
-}
-```
-**Core Problem Theory:**
-The root cause lies in the translation layer between the SGLang Server (which speaks the **OpenAI Chat Completions** and SSE stream format) and the `claude` CLI (which strictly speaks the **Anthropic Messages** and Anthropic SSE stream format). 
-
-1. **Streaming Issues (SSE Formats):** SGLang yields `data: {"id": "...", "choices": [{"delta": {"content": "..."}}]}`. The Anthropic CLI expects fine-grained `message_start`, `content_block_start`, `content_block_delta` (containing `text_delta`), `content_block_stop`, and `message_stop` events.
-2. **Missing Content Mapping:** For non-stream requests, `openai_data.get("choices")[0].get("message", {}).get("content", "")` might be entirely empty, missing, or structured differently by SGLang compared to what our proxy implementation expects. 
-
-**Next Actionable Step:**
-We have added raw verbose logging to `proxy.py` to capture exactly what SGLang is outputting to stdout (`[Proxy] Raw SGLang Response: {...}`). We will analyze the shape of the SGLang OpenAI JSON payload (both static and streamed) to correctly map its tokens to the Anthropic SSE format.
+8. **SSE Schema Mismatch — Empty Responses from Claude CLI**
+   - **Error**: Proxy returned `200 OK` with `"content": []` and `"usage": {"input_tokens": 0, "output_tokens": 0}`. The `claude` CLI showed 0 tokens.
+   - **Root Cause**: Five bugs in the OpenAI → Anthropic SSE translation layer:
+     1. **Missing `ping` event** — Anthropic SSE requires `event: ping` after `content_block_start`. The Claude SDK's httpx-sse parser uses this as a stream-alive signal.
+     2. **Missing `stream_options`** — Without `{"include_usage": true}` in the OpenAI request, SGLang never sends token counts in streaming chunks, so `output_tokens` was always 0.
+     3. **`content: null` not handled** — SGLang can return `"content": null` instead of `""`. `msg.get("content", "")` returns `None` (not `""`), and `if None:` is falsy → empty content array.
+     4. **Fragile first-chunk detection** — Used a monotonic `chunk_index` counter that always incremented, even for role-only chunks with no content. Replaced with a `sent_header` boolean that only flips on the first chunk with actual choices.
+     5. **No graceful stream termination** — If SGLang closed the stream without a `finish_reason`, the client never received `content_block_stop` / `message_delta` / `message_stop`, leaving the Claude CLI hanging.
+   - **Fix**: Rewrote the streaming generator in `proxy.py` to emit the full Anthropic SSE event sequence (`message_start` → `content_block_start` → `ping` → `content_block_delta`* → `content_block_stop` → `message_delta` → `message_stop`) with proper null-safety and graceful termination.
