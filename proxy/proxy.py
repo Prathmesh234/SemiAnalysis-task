@@ -3,6 +3,8 @@
 Handles both streaming (SSE) and non-streaming translation between the two
 API formats so that the ``claude`` CLI (which speaks Anthropic Messages API)
 can talk to an SGLang backend (which speaks OpenAI Chat Completions API).
+
+Captures per-request TTFT, ITL, and token counts for GPU benchmarking.
 """
 
 import json
@@ -16,10 +18,10 @@ from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="LLM Metrics Proxy")
 
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:30000")
 METRICS_PATH = Path("metrics.jsonl")
 # Always use the actual SGLang model name
-SGLANG_MODEL = os.environ.get("MODEL_PATH", "zai-org/GLM-4.5-Air-FP8")
+SGLANG_MODEL = os.environ.get("MODEL_PATH", "Qwen/Qwen3-8B")
 
 
 # ---------------------------------------------------------------------------
@@ -170,18 +172,25 @@ async def _handle_non_stream(
 
     try:
         openai_data = resp.json()
-        print(f"  [Proxy] Raw SGLang Response: {resp.content.decode()[:500]}...")
         anthropic_resp = _openai_to_anthropic(openai_data, model)
         text = ""
         if anthropic_resp.get("content"):
             text = anthropic_resp["content"][0].get("text", "")
         print(f"  [Proxy] Response: {text[:60]}... ({latency:.2f}s)")
         resp_bytes = json.dumps(anthropic_resp).encode()
+
+        # Extract usage for metrics
+        usage = openai_data.get("usage", {})
+        _log_metric(
+            "/v1/messages", latency, req_body, resp_bytes,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            ttft_s=latency,  # For non-streaming, TTFT = total latency
+        )
     except Exception as e:
         print(f"  [Proxy] Translation Error: {e}")
         resp_bytes = resp.content
-
-    _log_metric("/v1/messages", latency, req_body, resp_bytes, openai_resp=resp.content)
+        _log_metric("/v1/messages", latency, req_body, resp_bytes)
 
     return Response(
         content=resp_bytes,
@@ -197,13 +206,29 @@ async def _handle_non_stream(
 async def _handle_stream(
     openai_req: dict, model: str, t0: float, req_body: bytes, orig_body: dict
 ) -> StreamingResponse:
+    # Shared state between generator and the log call after it finishes.
+    # We use a mutable dict so the generator can write to it.
+    stream_state = {
+        "full_text": "",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "ttft_s": 0.0,
+        "itl_values": [],       # inter-token latency samples
+        "token_timestamps": [], # timestamp of each content delta
+        "msg_id": f"msg_{int(time.time())}",
+    }
+
     async def generate():
         full_text = ""
         sent_header = False       # True once message_start has been emitted
         stream_finished = False   # True once finish_reason received
-        msg_id = f"msg_{int(time.time())}"
+        msg_id = stream_state["msg_id"]
         input_tokens = 0
         output_tokens = 0
+
+        # TTFT / ITL tracking
+        first_token_time = None
+        last_token_time = None
 
         async with httpx.AsyncClient(timeout=300) as client:
             async with client.stream(
@@ -212,7 +237,8 @@ async def _handle_stream(
                 json=openai_req,
             ) as resp:
                 if resp.status_code != 200:
-                    print(f"  [Proxy] SGLang Error: {resp.status_code}")
+                    error_body = await resp.aread()
+                    print(f"  [Proxy] SGLang Error: {resp.status_code} {error_body.decode()[:200]}")
                     yield _sse_event("error", {
                         "type": "error",
                         "error": {"type": "api_error", "message": f"Backend error {resp.status_code}"},
@@ -279,7 +305,21 @@ async def _handle_stream(
 
                     # --- Content delta ----------------------------------------
                     if text:
-                        print(text, end="", flush=True)
+                        now = time.perf_counter()
+
+                        # Track TTFT (time from request start to first content)
+                        if first_token_time is None:
+                            first_token_time = now
+                            stream_state["ttft_s"] = round(now - t0, 6)
+
+                        # Track ITL (inter-token latency)
+                        if last_token_time is not None:
+                            itl = now - last_token_time
+                            stream_state["itl_values"].append(round(itl, 6))
+
+                        last_token_time = now
+                        stream_state["token_timestamps"].append(round(now - t0, 6))
+
                         full_text += text
                         yield _sse_event("content_block_delta", {
                             "type": "content_block_delta",
@@ -316,12 +356,39 @@ async def _handle_stream(
             })
             yield _sse_event("message_stop", {"type": "message_stop"})
 
-        print(f"\n  [Proxy] Stream complete. {len(full_text)} chars, {output_tokens} output tokens")
+        # Save state for the log call
+        stream_state["full_text"] = full_text
+        stream_state["input_tokens"] = input_tokens
+        stream_state["output_tokens"] = output_tokens
+        stream_state["msg_id"] = msg_id
+
         latency = time.perf_counter() - t0
+
+        # Compute ITL stats
+        itl_vals = stream_state["itl_values"]
+        itl_avg = sum(itl_vals) / len(itl_vals) if itl_vals else 0.0
+        itl_p50 = sorted(itl_vals)[len(itl_vals) // 2] if itl_vals else 0.0
+        itl_p99 = sorted(itl_vals)[min(int(len(itl_vals) * 0.99), len(itl_vals) - 1)] if itl_vals else 0.0
+
+        print(f"\n  [Proxy] Stream complete. "
+              f"{len(full_text)} chars, "
+              f"{output_tokens} out / {input_tokens} in tokens, "
+              f"TTFT={stream_state['ttft_s']*1000:.0f}ms, "
+              f"ITL_avg={itl_avg*1000:.1f}ms, "
+              f"E2E={latency:.2f}s")
+
         _log_metric(
             "/v1/messages", latency, req_body,
-            json.dumps({"full_text_length": len(full_text), "output_tokens": output_tokens}).encode(),
-            stream=True, full_text=full_text,
+            json.dumps({"output_tokens": output_tokens}).encode(),
+            stream=True,
+            full_text=full_text,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            ttft_s=stream_state["ttft_s"],
+            itl_avg_s=itl_avg,
+            itl_p50_s=itl_p50,
+            itl_p99_s=itl_p99,
+            itl_count=len(itl_vals),
         )
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -352,7 +419,11 @@ async def _forward_generic(request: Request) -> Response:
 
 def _log_metric(
     path: str, latency: float, req_body: bytes, resp_body: bytes,
-    openai_resp: bytes = b"", stream: bool = False, full_text: str = "",
+    stream: bool = False, full_text: str = "",
+    prompt_tokens: int = 0, completion_tokens: int = 0,
+    ttft_s: float = 0.0,
+    itl_avg_s: float = 0.0, itl_p50_s: float = 0.0, itl_p99_s: float = 0.0,
+    itl_count: int = 0,
 ) -> None:
     record: dict = {
         "ts": time.time(),
@@ -363,21 +434,27 @@ def _log_metric(
         "stream": stream,
     }
 
-    raw = openai_resp or resp_body
-    try:
-        data = json.loads(raw)
-        if "usage" in data:
-            usage = data["usage"]
-            record["usage"] = {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            }
-        if "model" in data: record["model"] = data["model"]
-        if "id" in data: record["request_id"] = data["id"]
-    except: pass
+    # Token counts (always set from caller)
+    if prompt_tokens or completion_tokens:
+        record["usage"] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
 
-    if stream and full_text: record["completion_text_length"] = len(full_text)
+    # GPU benchmark metrics: TTFT + ITL
+    if ttft_s > 0:
+        record["ttft_s"] = round(ttft_s, 6)
+    if itl_count > 0:
+        record["itl"] = {
+            "avg_s": round(itl_avg_s, 6),
+            "p50_s": round(itl_p50_s, 6),
+            "p99_s": round(itl_p99_s, 6),
+            "count": itl_count,
+        }
+
+    if stream and full_text:
+        record["completion_text_length"] = len(full_text)
 
     with METRICS_PATH.open("a") as f:
         f.write(json.dumps(record) + "\n")

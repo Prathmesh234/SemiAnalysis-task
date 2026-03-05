@@ -40,6 +40,14 @@ async def main(domain: str, concurrency: int, n_tasks: int | None) -> None:
 
     print(f"\nCompleted {len(results)} tasks")
 
+    import json
+    # Save the generated final outputs to output.json for manual verification
+    output_data = {}
+    for task, res in zip(tasks, results):
+        output_data[task.instance_id] = res
+    Path("output.json").write_text(json.dumps(output_data, indent=2))
+    print("💾 Final generations saved to output.json")
+
     # Collect comprehensive metrics from all sources
     print("\n📊 Collecting metrics from proxy + SGLang Prometheus + nvidia-smi ...")
     metrics = collect()
